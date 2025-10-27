@@ -1,0 +1,17 @@
+version: "3.9"
+
+services:
+  db:
+    image: ankane/pgvector:latest
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: airplane_chat
+      POSTGRES_USER: airplane
+      POSTGRES_PASSWORD: airplane
+    ports:
+      - "5433:5432"
+    volumes:
+      - pgvector-data:/var/lib/postgresql/data
+
+volumes:
+  pgvector-data:

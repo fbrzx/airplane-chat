@@ -181,12 +181,13 @@ func (m *Manager) SaveDocument(conversationID, originalName string, data []byte)
 	}
 
 	document := Document{
-		ID:         docID,
-		Name:       originalName,
-		StoredPath: storedPath,
-		TextPath:   textPath,
-		Size:       int64(len(data)),
-		UploadedAt: now,
+		ID:           docID,
+		Name:         originalName,
+		StoredPath:   storedPath,
+		TextPath:     textPath,
+		Size:         int64(len(data)),
+		UploadedAt:   now,
+		ContentCache: text,
 	}
 
 	lock := m.lockFor(conversationID)
@@ -212,7 +213,20 @@ func (m *Manager) ListDocuments(conversationID string) ([]Document, error) {
 	if err := m.EnsureConversation(conversationID); err != nil {
 		return nil, err
 	}
-	return m.loadDocuments(conversationID)
+	docs, err := m.loadDocuments(conversationID)
+	if err != nil {
+		return nil, err
+	}
+
+	for i := range docs {
+		if docs[i].ContentCache == "" {
+			if data, err := os.ReadFile(docs[i].TextPath); err == nil {
+				docs[i].ContentCache = string(data)
+			}
+		}
+	}
+
+	return docs, nil
 }
 
 // LoadDocumentTexts returns the extracted textual content of all documents for
@@ -232,6 +246,19 @@ func (m *Manager) LoadDocumentTexts(conversationID string) ([]string, error) {
 		texts = append(texts, string(data))
 	}
 	return texts, nil
+}
+
+// DocumentText returns the extracted text for a specific document.
+func (m *Manager) DocumentText(doc Document) (string, error) {
+	if doc.ContentCache != "" {
+		return doc.ContentCache, nil
+	}
+
+	data, err := os.ReadFile(doc.TextPath)
+	if err != nil {
+		return "", fmt.Errorf("read document text: %w", err)
+	}
+	return string(data), nil
 }
 
 func (m *Manager) loadDocuments(conversationID string) ([]Document, error) {

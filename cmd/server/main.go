@@ -13,9 +13,11 @@ import (
 	"time"
 
 	"github.com/fabfab/airplane-chat/internal/config"
+	"github.com/fabfab/airplane-chat/internal/embeddings"
 	"github.com/fabfab/airplane-chat/internal/ollama"
 	"github.com/fabfab/airplane-chat/internal/server"
 	"github.com/fabfab/airplane-chat/internal/storage"
+	"github.com/fabfab/airplane-chat/internal/vectorstore"
 )
 
 func main() {
@@ -40,8 +42,19 @@ func main() {
 		log.Fatalf("failed to set up storage: %v", err)
 	}
 
+	embedder := embeddings.NewOllamaEmbedder(cfg.Ollama.Host, cfg.Embed.Model, cfg.Embed.Dimension, 90*time.Second)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	vectorStore, err := vectorstore.NewPostgresStore(ctx, cfg.Database.URL, cfg.Database.MaxConnections, cfg.Embed.Dimension)
+	if err != nil {
+		log.Fatalf("failed to connect vector store: %v", err)
+	}
+	defer vectorStore.Close()
+
 	llmClient := ollama.NewClient(cfg.Ollama.Host, cfg.Ollama.Model)
-	srv := server.New(cfg, store, llmClient)
+	srv := server.New(cfg, store, llmClient, embedder, vectorStore)
 
 	httpServer := &http.Server{
 		Addr:    cfg.Address,

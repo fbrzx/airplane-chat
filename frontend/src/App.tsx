@@ -200,6 +200,12 @@ const App: React.FC = () => {
       <section className="chat">
         <header className="chat-header">
           <h1>Airplane Chat</h1>
+          {conversationId ? (
+            <div className="chat-meta">
+              <span>Conversation ID:</span>
+              <code>{conversationId}</code>
+            </div>
+          ) : null}
         </header>
         <div className="messages">
           {messages.length === 0 ? (

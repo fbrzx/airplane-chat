@@ -1,10 +1,12 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"strings"
 	"time"
@@ -15,20 +17,24 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/fabfab/airplane-chat/internal/config"
+	"github.com/fabfab/airplane-chat/internal/embeddings"
 	"github.com/fabfab/airplane-chat/internal/ollama"
 	"github.com/fabfab/airplane-chat/internal/storage"
+	"github.com/fabfab/airplane-chat/internal/vectorstore"
 )
 
 // Server wires HTTP handlers to the underlying chat and storage services.
 type Server struct {
-	cfg     config.Config
-	router  http.Handler
-	storage *storage.Manager
-	llm     ollama.Client
+	cfg         config.Config
+	router      http.Handler
+	storage     *storage.Manager
+	llm         ollama.Client
+	embedder    embeddings.Embedder
+	vectorStore *vectorstore.Store
 }
 
 // New constructs a Server with the provided dependencies.
-func New(cfg config.Config, store *storage.Manager, llmClient ollama.Client) *Server {
+func New(cfg config.Config, store *storage.Manager, llmClient ollama.Client, embedder embeddings.Embedder, vectors *vectorstore.Store) *Server {
 	mux := chi.NewRouter()
 	mux.Use(middleware.RequestID)
 	mux.Use(middleware.RealIP)
@@ -43,10 +49,12 @@ func New(cfg config.Config, store *storage.Manager, llmClient ollama.Client) *Se
 	}))
 
 	s := &Server{
-		cfg:     cfg,
-		router:  mux,
-		storage: store,
-		llm:     llmClient,
+		cfg:         cfg,
+		router:      mux,
+		storage:     store,
+		llm:         llmClient,
+		embedder:    embedder,
+		vectorStore: vectors,
 	}
 
 	mux.Get("/api/health", s.handleHealth)
@@ -132,7 +140,47 @@ func (s *Server) handlePostMessage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	ollamaMessages := buildPrompt(history, s.storage, id)
+	var snippetTexts []string
+	if s.embedder != nil && s.vectorStore != nil {
+		if queries, err := s.embedder.Embed(r.Context(), []string{payload.Content}); err != nil {
+			log.Printf("embed query failed: %v", err)
+		} else if len(queries) > 0 {
+			if chunks, err := s.vectorStore.QuerySimilar(r.Context(), id, queries[0], s.cfg.Database.SearchTopK); err != nil {
+				log.Printf("query similar chunks failed: %v", err)
+			} else {
+				for i, chunk := range chunks {
+					content := strings.TrimSpace(trimToLimit(chunk.Content, 2000))
+					if content == "" {
+						continue
+					}
+					snippetTexts = append(snippetTexts, fmt.Sprintf("Snippet %d (score %.2f, doc %s):\n%s", i+1, chunk.Score, chunk.DocumentID, content))
+				}
+			}
+		}
+	}
+
+	if len(snippetTexts) == 0 {
+		const (
+			maxDocCharacters = 1200
+			maxCombinedDocs  = 8000
+		)
+		if texts, err := s.storage.LoadDocumentTexts(id); err == nil {
+			total := 0
+			for i, text := range texts {
+				trimmed := strings.TrimSpace(trimToLimit(text, maxDocCharacters))
+				if trimmed == "" {
+					continue
+				}
+				if total+len(trimmed) > maxCombinedDocs {
+					break
+				}
+				snippetTexts = append(snippetTexts, fmt.Sprintf("Document %d excerpt:\n%s", i+1, trimmed))
+				total += len(trimmed)
+			}
+		}
+	}
+
+	ollamaMessages := buildPrompt(history, snippetTexts)
 	response, err := s.llm.Generate(r.Context(), ollamaMessages)
 	if err != nil {
 		writeError(w, http.StatusBadGateway, fmt.Errorf("generate response: %w", err))
@@ -213,43 +261,48 @@ func (s *Server) handleUploadDocument(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if s.embedder != nil && s.vectorStore != nil {
+		if err := s.indexDocument(r.Context(), id, document); err != nil {
+			log.Printf("index document %s failed: %v", document.ID, err)
+		}
+	}
+
 	writeJSON(w, http.StatusCreated, map[string]any{
 		"document": document,
 	})
 }
 
-func buildPrompt(history []storage.Message, store *storage.Manager, conversationID string) []ollama.Message {
-	const (
-		maxDocCharacters = 8000
-		maxCombinedDocs  = 24000
-	)
-
-	docMessages := []string{}
-	if store != nil {
-		if texts, err := store.LoadDocumentTexts(conversationID); err == nil {
-			total := 0
-			for _, text := range texts {
-				trimmed := trimToLimit(text, maxDocCharacters)
-				if trimmed == "" {
-					continue
-				}
-				if total+len(trimmed) > maxCombinedDocs {
-					break
-				}
-				docMessages = append(docMessages, trimmed)
-				total += len(trimmed)
-			}
-		}
+func (s *Server) indexDocument(ctx context.Context, conversationID string, document storage.Document) error {
+	if s.embedder == nil || s.vectorStore == nil {
+		return nil
 	}
 
+	text, err := s.storage.DocumentText(document)
+	if err != nil {
+		return err
+	}
+
+	chunks := chunkText(text, 1500, 250)
+	if len(chunks) == 0 {
+		return nil
+	}
+
+	vectors, err := s.embedder.Embed(ctx, chunks)
+	if err != nil {
+		return err
+	}
+
+	return s.vectorStore.UpsertDocumentChunks(ctx, conversationID, document.ID, chunks, vectors)
+}
+
+func buildPrompt(history []storage.Message, snippets []string) []ollama.Message {
 	var messages []ollama.Message
 
-	systemContent := "You are a helpful assistant. Answer the user's question using the conversation history"
-	if len(docMessages) > 0 {
-		systemContent += " and the following reference documents.\n\n"
-		for i, doc := range docMessages {
-			systemContent += fmt.Sprintf("Document %d:\n%s\n\n", i+1, doc)
-		}
+	systemContent := "You are a helpful assistant. Answer the user's question using the conversation history."
+	if len(snippets) > 0 {
+		systemContent += " The following document snippets may be useful:\n\n"
+		systemContent += strings.Join(snippets, "\n\n")
+		systemContent += "\n\nCite snippets explicitly when you rely on them."
 	}
 	messages = append(messages, ollama.Message{
 		Role:    "system",
@@ -271,6 +324,47 @@ func trimToLimit(text string, limit int) string {
 		return text
 	}
 	return text[:limit]
+}
+
+func chunkText(input string, chunkSize int, overlap int) []string {
+	if chunkSize <= 0 {
+		return []string{}
+	}
+	if len(input) <= chunkSize {
+		return []string{strings.TrimSpace(input)}
+	}
+
+	if overlap >= chunkSize {
+		overlap = chunkSize / 4
+	}
+	if overlap < 0 {
+		overlap = 0
+	}
+
+	var chunks []string
+	runes := []rune(input)
+	total := len(runes)
+
+	step := chunkSize - overlap
+	if step <= 0 {
+		step = chunkSize
+	}
+
+	for start := 0; start < total; start += step {
+		end := start + chunkSize
+		if end > total {
+			end = total
+		}
+		chunk := strings.TrimSpace(string(runes[start:end]))
+		if chunk != "" {
+			chunks = append(chunks, chunk)
+		}
+		if end == total {
+			break
+		}
+	}
+
+	return chunks
 }
 
 func writeJSON(w http.ResponseWriter, status int, payload any) {
